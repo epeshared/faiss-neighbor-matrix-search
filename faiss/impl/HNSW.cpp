@@ -7,8 +7,11 @@
 
 #include <faiss/impl/HNSW.h>
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstddef>
+#include <cstdlib>
+#include <unordered_map>
 
 #include <faiss/IndexHNSW.h>
 
@@ -25,6 +28,81 @@
 #endif
 
 namespace faiss {
+
+namespace {
+
+struct Level0BlockSearchConfig {
+    int frontier_window = 1;
+    int keep_top_t = 0;
+    float graph_mix_lambda = 0.8f;
+
+    bool enabled() const {
+        return frontier_window > 1 && keep_top_t > 0;
+    }
+};
+
+int getenv_int(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return default_value;
+    }
+
+    char* endptr = nullptr;
+    long parsed = std::strtol(value, &endptr, 10);
+    if (endptr == value) {
+        return default_value;
+    }
+    return static_cast<int>(parsed);
+}
+
+float getenv_float(const char* name, float default_value) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return default_value;
+    }
+
+    char* endptr = nullptr;
+    float parsed = std::strtof(value, &endptr);
+    if (endptr == value) {
+        return default_value;
+    }
+    return parsed;
+}
+
+const Level0BlockSearchConfig& get_level0_block_search_config() {
+    static const Level0BlockSearchConfig config = [] {
+        Level0BlockSearchConfig cfg;
+        cfg.frontier_window = getenv_int("FAISS_AMX_LEVEL0_FRONTIER_WINDOW", 1);
+        cfg.keep_top_t = getenv_int("FAISS_AMX_LEVEL0_BLOCK_KEEP", 0);
+        cfg.graph_mix_lambda = getenv_float("FAISS_AMX_LEVEL0_GRAPH_MIX_LAMBDA", 0.8f);
+        cfg.frontier_window = std::max(1, cfg.frontier_window);
+        cfg.keep_top_t = std::max(0, cfg.keep_top_t);
+        cfg.graph_mix_lambda = std::min(1.0f, std::max(0.0f, cfg.graph_mix_lambda));
+        return cfg;
+    }();
+    return config;
+}
+
+struct BlockCandidate {
+    HNSW::storage_idx_t id;
+    float parent_sum_dis;
+    float parent_best_dis;
+    int parent_count;
+    float exact_dis;
+    float mixed_dis;
+};
+
+bool use_level0_block_search(const DistanceComputer& qdis, int level) {
+    if (level != 0) {
+        return false;
+    }
+    if (!dynamic_cast<const NegativeDistanceComputer*>(&qdis)) {
+        return false;
+    }
+    return get_level0_block_search_config().enabled();
+}
+
+} // namespace
 
 /**************************************************************
  * HNSW structure implementation
@@ -625,6 +703,7 @@ int search_from_candidates(
         int level,
         int nres_in,
         const SearchParameters* params) {
+    const auto& block_cfg = get_level0_block_search_config();
     int nres = nres_in;
     int ndis = 0;
 
@@ -646,6 +725,183 @@ int search_from_candidates(
             }
         }
         vt.set(v1);
+    }
+
+    if (use_level0_block_search(qdis, level)) {
+        int nstep = 0;
+        std::vector<HNSW::storage_idx_t> frontier_ids;
+        std::vector<float> frontier_dis;
+        std::vector<BlockCandidate> block_candidates;
+        std::unordered_map<HNSW::storage_idx_t, size_t> block_pos;
+
+        frontier_ids.reserve(block_cfg.frontier_window);
+        frontier_dis.reserve(block_cfg.frontier_window);
+
+        while (candidates.size() > 0) {
+            float d0 = 0;
+            int v0 = candidates.pop_min(&d0);
+
+            if (do_dis_check) {
+                int n_dis_below = candidates.count_below(d0);
+                if (n_dis_below >= efSearch) {
+                    break;
+                }
+            }
+
+            frontier_ids.clear();
+            frontier_dis.clear();
+            frontier_ids.push_back(v0);
+            frontier_dis.push_back(d0);
+
+            while (frontier_ids.size() < block_cfg.frontier_window &&
+                   candidates.size() > 0) {
+                float di = 0;
+                int vi = candidates.pop_min(&di);
+                if (vi < 0) {
+                    break;
+                }
+                frontier_ids.push_back(vi);
+                frontier_dis.push_back(di);
+            }
+
+            block_candidates.clear();
+            block_pos.clear();
+
+            size_t reserve_hint = 0;
+            for (size_t frontier_idx = 0; frontier_idx < frontier_ids.size(); frontier_idx++) {
+                size_t begin, end;
+                hnsw.neighbor_range(frontier_ids[frontier_idx], level, &begin, &end);
+                reserve_hint += end - begin;
+            }
+            block_candidates.reserve(reserve_hint);
+            block_pos.reserve(reserve_hint);
+
+            for (size_t frontier_idx = 0; frontier_idx < frontier_ids.size(); frontier_idx++) {
+                size_t begin, end;
+                hnsw.neighbor_range(frontier_ids[frontier_idx], level, &begin, &end);
+                for (size_t j = begin; j < end; j++) {
+                    int v1 = hnsw.neighbors[j];
+                    if (v1 < 0) {
+                        break;
+                    }
+                    vt.prefetch(v1);
+                }
+
+                const float parent_dis = frontier_dis[frontier_idx];
+                for (size_t j = begin; j < end; j++) {
+                    int v1 = hnsw.neighbors[j];
+                    if (v1 < 0) {
+                        break;
+                    }
+
+                    auto it = block_pos.find(v1);
+                    if (it != block_pos.end()) {
+                        BlockCandidate& candidate = block_candidates[it->second];
+                        candidate.parent_sum_dis += parent_dis;
+                        candidate.parent_best_dis =
+                                std::min(candidate.parent_best_dis, parent_dis);
+                        candidate.parent_count += 1;
+                        continue;
+                    }
+
+                    if (!vt.set(v1)) {
+                        continue;
+                    }
+
+                    block_pos.emplace(v1, block_candidates.size());
+                    block_candidates.push_back(
+                            {v1, parent_dis, parent_dis, 1, 0.0f, 0.0f});
+                }
+            }
+
+            if (!block_candidates.empty()) {
+                size_t i = 0;
+                for (; i + 3 < block_candidates.size(); i += 4) {
+                    float dis0, dis1, dis2, dis3;
+                    qdis.distances_batch_4(
+                            block_candidates[i + 0].id,
+                            block_candidates[i + 1].id,
+                            block_candidates[i + 2].id,
+                            block_candidates[i + 3].id,
+                            dis0,
+                            dis1,
+                            dis2,
+                            dis3);
+                    block_candidates[i + 0].exact_dis = dis0;
+                    block_candidates[i + 1].exact_dis = dis1;
+                    block_candidates[i + 2].exact_dis = dis2;
+                    block_candidates[i + 3].exact_dis = dis3;
+                    ndis += 4;
+                }
+
+                for (; i < block_candidates.size(); i++) {
+                    block_candidates[i].exact_dis = qdis(block_candidates[i].id);
+                    ndis += 1;
+                }
+
+                for (BlockCandidate& candidate : block_candidates) {
+                    const float parent_avg =
+                            candidate.parent_sum_dis / candidate.parent_count;
+                    candidate.mixed_dis =
+                            block_cfg.graph_mix_lambda * candidate.exact_dis +
+                            (1.0f - block_cfg.graph_mix_lambda) * parent_avg;
+                }
+
+                const size_t keep_count = std::min(
+                        block_candidates.size(),
+                        static_cast<size_t>(block_cfg.keep_top_t));
+
+                auto cmp_candidate = [](const BlockCandidate& lhs,
+                                        const BlockCandidate& rhs) {
+                    if (lhs.mixed_dis != rhs.mixed_dis) {
+                        return lhs.mixed_dis < rhs.mixed_dis;
+                    }
+                    return lhs.exact_dis < rhs.exact_dis;
+                };
+
+                if (keep_count < block_candidates.size()) {
+                    std::nth_element(
+                            block_candidates.begin(),
+                            block_candidates.begin() + keep_count,
+                            block_candidates.end(),
+                            cmp_candidate);
+                    block_candidates.resize(keep_count);
+                }
+                std::sort(
+                        block_candidates.begin(),
+                        block_candidates.end(),
+                        cmp_candidate);
+
+                threshold = res.threshold;
+                for (const BlockCandidate& candidate : block_candidates) {
+                    if (!sel || sel->is_member(candidate.id)) {
+                        if (candidate.exact_dis < threshold) {
+                            if (res.add_result(candidate.exact_dis, candidate.id)) {
+                                threshold = res.threshold;
+                                nres += 1;
+                            }
+                        }
+                    }
+                    candidates.push(candidate.id, candidate.exact_dis);
+                }
+            }
+
+            nstep += frontier_ids.size();
+            if (!do_dis_check && nstep > efSearch) {
+                break;
+            }
+        }
+
+        if (level == 0) {
+            stats.n1++;
+            if (candidates.size() == 0) {
+                stats.n2++;
+            }
+            stats.ndis += ndis;
+            stats.nhops += nstep;
+        }
+
+        return nres;
     }
 
     int nstep = 0;
